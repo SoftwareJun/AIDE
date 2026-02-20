@@ -107,7 +107,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 weight_decay_value = group["weight_decay"]
         metric_logger.update(weight_decay=weight_decay_value)
         if use_amp:
-            metric_logger.update(grad_norm=grad_norm)
+            if grad_norm is not None and math.isfinite(grad_norm):
+                metric_logger.update(grad_norm=grad_norm)
         if log_writer is not None:
             log_writer.update(loss=loss_value, head="loss")
             log_writer.update(class_acc=class_acc, head="loss")
@@ -133,6 +134,9 @@ def evaluate(data_loader, model, device, use_amp=False):
     # switch to evaluation mode
     model.eval()
 
+    all_outputs = []
+    all_labels = []
+
     for index, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         images = batch[0]
         target = batch[-1]
@@ -142,7 +146,7 @@ def evaluate(data_loader, model, device, use_amp=False):
 
         # compute output
         if use_amp:
-            with torch.cuda.amp.autocast(dytpe=torch.bfloat16):
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 output = model(images)
                 if isinstance(output, dict):
                     output = output['logits']
@@ -154,12 +158,8 @@ def evaluate(data_loader, model, device, use_amp=False):
             
             loss = criterion(output, target)
         
-        if index == 0:
-            predictions = output
-            labels = target
-        else:
-            predictions = torch.cat((predictions, output), 0)
-            labels = torch.cat((labels, target), 0)
+        all_outputs.append(output.detach())
+        all_labels.append(target.detach())
 
         torch.cuda.synchronize()
 
@@ -174,14 +174,19 @@ def evaluate(data_loader, model, device, use_amp=False):
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
+    predictions = torch.cat(all_outputs, dim=0)
+    labels = torch.cat(all_labels, dim=0)
 
-    output_ddp = [torch.zeros_like(predictions) for _ in range(utils.get_world_size())]
-    dist.all_gather(output_ddp, predictions)
-    labels_ddp = [torch.zeros_like(labels) for _ in range(utils.get_world_size())]
-    dist.all_gather(labels_ddp, labels)
-
-    output_all = torch.concat(output_ddp, dim=0)
-    labels_all = torch.concat(labels_ddp, dim=0)
+    if dist.is_available() and dist.is_initialized():
+        output_ddp = [torch.zeros_like(predictions) for _ in range(dist.get_world_size())]
+        dist.all_gather(output_ddp, predictions)
+        labels_ddp = [torch.zeros_like(labels) for _ in range(dist.get_world_size())]
+        dist.all_gather(labels_ddp, labels)
+        output_all = torch.concat(output_ddp, dim=0)
+        labels_all = torch.concat(labels_ddp, dim=0)
+    else:
+        output_all = predictions
+        labels_all = labels
 
 
     y_pred = softmax(output_all.detach().cpu().numpy(), axis=1)[:, 1]
